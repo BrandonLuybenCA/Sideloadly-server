@@ -1,0 +1,391 @@
+name: Sideloadly Server
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 */6 * *'
+
+jobs:
+  sideloadly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt update -qq
+          sudo apt install -y -qq libimobiledevice6 libimobiledevice-utils ideviceinstaller \
+            openssl curl unzip jq python3 python3-pip git build-essential \
+            strongswan strongswan-pki libstrongswan-extra-plugins iptables qrencode
+          git clone -q https://github.com/zhlynn/zsign.git /tmp/zsign
+          cd /tmp/zsign && make -j$(nproc) && sudo make install
+
+      - name: Start Anisette
+        run: |
+          python3 -c "
+          import json,time,uuid,random,hashlib
+          from http.server import HTTPServer,BaseHTTPRequestHandler
+          class H(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  mid=''.join(random.choices('0123456789abcdef',k=32))
+                  r={'X-Apple-I-MD':mid,'X-Apple-I-MD-RINFO':'17106176',
+                     'X-Apple-I-MD-M':hashlib.md5(mid.encode()).hexdigest(),
+                     'X-Apple-I-SRL-NO':'C02'+''.join(random.choices('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',k=10)),
+                     'X-Apple-I-Client-Time':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+                     'X-Apple-I-TimeZone':'UTC','X-Apple-I-Locale':'en_US',
+                     'X-Apple-I-DI':str(uuid.uuid4()).upper()}
+                  self.send_response(200);self.send_header('Content-Type','application/json')
+                  self.end_headers();self.wfile.write(json.dumps(r).encode())
+              def log_message(self,*a):pass
+          HTTPServer(('',6969),H).serve_forever()
+          " &
+          sleep 2 && curl -s http://localhost:6969 | head -c 50
+          echo "ANISETTE OK"
+
+      - name: Setup VPN certs
+        run: |
+          mkdir -p /tmp/vpn
+          ipsec pki --gen --type rsa --size 4096 --outform pem > /tmp/vpn/ca-key.pem
+          ipsec pki --self --ca --lifetime 3650 --in /tmp/vpn/ca-key.pem \
+            --dn "CN=CA" --outform pem > /tmp/vpn/ca-cert.pem
+          ipsec pki --gen --type rsa --size 2048 --outform pem > /tmp/vpn/server-key.pem
+          ipsec pki --pub --in /tmp/vpn/server-key.pem | ipsec pki --issue --lifetime 365 \
+            --cacert /tmp/vpn/ca-cert.pem --cakey /tmp/vpn/ca-key.pem \
+            --dn "CN=sideloadly" --san sideloadly --san localhost \
+            --flag serverAuth --flag ikeIntermediate --outform pem > /tmp/vpn/server-cert.pem
+
+      - name: Start VPN server
+        run: |
+          sudo cp /tmp/vpn/ca-cert.pem /etc/ipsec.d/cacerts/
+          sudo cp /tmp/vpn/server-cert.pem /etc/ipsec.d/certs/
+          sudo cp /tmp/vpn/server-key.pem /etc/ipsec.d/private/
+          sudo chmod 600 /etc/ipsec.d/private/server-key.pem
+          sudo tee /etc/ipsec.conf > /dev/null << 'EOF'
+          config setup
+              uniqueids=no
+          conn ikev2-vpn
+              auto=add
+              type=tunnel
+              keyexchange=ikev2
+              fragmentation=yes
+              forceencaps=yes
+              dpdaction=clear
+              dpddelay=300s
+              rekey=no
+              left=%any
+              leftcert=/etc/ipsec.d/certs/server-cert.pem
+              leftsendcert=always
+              leftsubnet=0.0.0.0/0
+              right=%any
+              rightid=%any
+              rightauth=eap-mschapv2
+              rightsourceip=10.10.10.0/24
+              rightdns=1.1.1.1,8.8.8.8
+              rightsendcert=never
+              eap_identity=%identity
+          EOF
+          sudo tee /etc/ipsec.secrets > /dev/null << 'EOF'
+          : RSA /etc/ipsec.d/private/server-key.pem
+          EOF
+          IPHONE_PASS=$(openssl rand -base64 12)
+          echo "iphone : EAP \"$IPHONE_PASS\"" | sudo tee /etc/ipsec.eap-secrets
+          echo "IPHONE_PASS=$IPHONE_PASS" >> $GITHUB_ENV
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -o eth0 -j MASQUERADE
+          sudo ipsec restart && sleep 3
+          echo "VPN OK"
+
+      - name: Apple login + cert generation
+        id: cert
+        run: |
+          ANISETTE=$(curl -s http://localhost:6969)
+          MID=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-MD"]')
+          RINFO=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-MD-RINFO"]')
+          SERIAL=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-SRL-NO"]')
+          CTIME=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-Client-Time"]')
+          
+          HEADERS=(-H "X-Apple-I-MD: $MID" -H "X-Apple-I-MD-RINFO: $RINFO" \
+                   -H "X-Apple-I-SRL-NO: $SERIAL" -H "X-Apple-I-Client-Time: $CTIME" \
+                   -H "Content-Type: application/json" -H "Accept: application/json")
+          
+          echo "Logging in..."
+          RESP=$(curl -s -D /tmp/h.txt -X POST "https://idmsa.apple.com/appleauth/auth/signin" \
+            "${HEADERS[@]}" \
+            -d "{\"accountName\":\"${{ secrets.APPLE_ID }}\",\"password\":\"${{ secrets.APPLE_PASSWORD }}\",\"rememberMe\":true}")
+          
+          TOKEN=$(grep -i "X-Apple-Session-Token" /tmp/h.txt | awk -F': ' '{print $2}' | tr -d '\r')
+          
+          if [ -z "$TOKEN" ]; then
+            echo "Login failed. Response:"
+            echo "$RESP" | head -20
+            exit 1
+          fi
+          
+          echo "SESSION_TOKEN=$TOKEN" >> $GITHUB_ENV
+          echo "Got session token"
+          
+          # Get team ID
+          TEAM_ID=$(curl -s -X POST "https://developerservices2.apple.com/services/QH65B2/listTeams.action" \
+            "${HEADERS[@]}" -H "X-Apple-Session-Token: $TOKEN" \
+            -H "Content-Type: text/x-xml-plist" | \
+            python3 -c "import sys,plistlib; d=plistlib.loads(sys.stdin.buffer.read()); print(d.get('teams',[{}])[0].get('teamId',''))" 2>/dev/null)
+          
+          echo "TEAM_ID=$TEAM_ID" >> $GITHUB_ENV
+          echo "Team: $TEAM_ID"
+          
+          # Generate key + CSR
+          openssl genrsa -out /tmp/key.pem 2048
+          openssl req -new -key /tmp/key.pem -out /tmp/csr.pem \
+            -subj "/CN=Temp/OU=$TEAM_ID/O=Sideloadly/C=US"
+          
+          CSR_DATA=$(cat /tmp/csr.pem)
+          
+          # Request cert from Apple
+          CERT_RESP=$(curl -s -X POST \
+            "https://developerservices2.apple.com/services/QH65B2/ios/submitDevelopmentCSR.action" \
+            "${HEADERS[@]}" -H "X-Apple-Session-Token: $TOKEN" \
+            -H "Content-Type: text/x-xml-plist" \
+            -d "$(python3 -c "import plistlib; print(plistlib.dumps({'csr':'$CSR_DATA','teamId':'$TEAM_ID','type':'ios_development'}).decode())")")
+          
+          CERT_DATA=$(echo "$CERT_RESP" | python3 -c "
+          import sys,plistlib
+          try:
+              d=plistlib.loads(sys.stdin.buffer.read())
+              print(d.get('certificate',''))
+          except: pass
+          " 2>/dev/null)
+          
+          if [ -z "$CERT_DATA" ]; then
+            echo "Cert request failed:"
+            echo "$CERT_RESP" | head -20
+            exit 1
+          fi
+          
+          echo "$CERT_DATA" > /tmp/cert.pem
+          openssl pkcs12 -export -in /tmp/cert.pem -inkey /tmp/key.pem \
+            -out /tmp/dev.p12 -passout pass:sideloadly
+          
+          echo "P12_PATH=/tmp/dev.p12" >> $GITHUB_ENV
+          echo "P12_PASS=sideloadly" >> $GITHUB_ENV
+          echo "Cert generated"
+
+      - name: Wait for iPhone + Pair
+        run: |
+          echo "Waiting for iPhone VPN connection..."
+          for i in $(seq 1 60); do
+            if sudo ipsec status ikev2-vpn 2>/dev/null | grep -q "ESTABLISHED"; then
+              IPHONE_IP=$(sudo ipsec status ikev2-vpn | grep -oP '10\.10\.10\.\d+' | head -1)
+              echo "IPHONE_IP=$IPHONE_IP" >> $GITHUB_ENV
+              echo "iPhone connected: $IPHONE_IP"
+              
+              echo "Attempting pair..."
+              idevicepair -n -d "$IPHONE_IP" pair 2>&1 || echo "Pair attempted (check Trust popup)"
+              
+              ideviceinfo -n -d "$IPHONE_IP" &>/dev/null && {
+                UDID=$(ideviceinfo -n -d "$IPHONE_IP" | grep "^UniqueDeviceID:" | awk '{print $2}')
+                echo "UDID=$UDID" >> $GITHUB_ENV
+                echo "Paired! UDID: $UDID"
+              }
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Create provisioning profile
+        run: |
+          cat > /tmp/profile.plist << PROFILE
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>ApplicationIdentifierPrefix</key>
+              <array><string>${{ env.TEAM_ID }}</string></array>
+              <key>CreationDate</key>
+              <date>$(date -u +"%Y-%m-%dT%H:%M:%SZ")</date>
+              <key>ExpirationDate</key>
+              <date>$(date -u -d "+7 days" +"%Y-%m-%dT%H:%M:%SZ")</date>
+              <key>ProvisionedDevices</key>
+              <array><string>${{ env.UDID }}</string></array>
+              <key>TeamIdentifier</key>
+              <array><string>${{ env.TEAM_ID }}</string></array>
+              <key>UUID</key>
+              <string>$(uuidgen)</string>
+              <key>Version</key>
+              <integer>1</integer>
+              <key>Entitlements</key>
+              <dict>
+                  <key>application-identifier</key>
+                  <string>${{ env.TEAM_ID }}.*</string>
+                  <key>com.apple.developer.team-identifier</key>
+                  <string>${{ env.TEAM_ID }}</string>
+                  <key>get-task-allow</key>
+                  <true/>
+              </dict>
+          </dict>
+          </plist>
+          PROFILE
+          echo "Profile created"
+
+      - name: Sign and install IPA
+        run: |
+          if [ -z "${{ env.IPHONE_IP }}" ]; then
+            echo "iPhone not connected. Skipping install."
+            exit 0
+          fi
+          
+          # If you have an IPA URL, download it
+          # curl -L "${{ secrets.IPA_URL }}" -o /tmp/app.ipa
+          
+          # Or check if one was uploaded via web UI
+          if [ -f /tmp/sideloadly/uploads/*.ipa ]; then
+            cp /tmp/sideloadly/uploads/*.ipa /tmp/app.ipa
+          fi
+          
+          if [ ! -f /tmp/app.ipa ]; then
+            echo "No IPA found. Place IPA at /tmp/app.ipa or set IPA_URL secret."
+            echo "Server still running - upload via web UI if available."
+          else
+            zsign -k /tmp/dev.p12 -p sideloadly -m /tmp/profile.plist \
+              -o /tmp/signed.ipa /tmp/app.ipa
+            ideviceinstaller -n -d "${{ env.IPHONE_IP }}" install /tmp/signed.ipa
+            echo "Installed!"
+          fi
+
+      - name: Start Web UI
+        run: |
+          pip3 install -q flask flask-cors
+          cat > /tmp/server.py << 'PYEOF'
+          import os, json, time, uuid, subprocess, base64
+          from pathlib import Path
+          from flask import Flask, request, jsonify, render_template_string
+          from flask_cors import CORS
+          
+          app = Flask(__name__)
+          CORS(app)
+          
+          WORK = Path("/tmp/sideloadly")
+          UPLOADS = WORK / "uploads"
+          SIGNED = WORK / "signed"
+          for d in [WORK, UPLOADS, SIGNED]: d.mkdir(parents=True, exist_ok=True)
+          
+          HTML = """<!DOCTYPE html><html><head>
+          <title>Sideloadly</title>
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <style>
+          *{margin:0;padding:0;box-sizing:border-box}
+          body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#000;color:#fff}
+          .container{max-width:600px;margin:0 auto;padding:16px}
+          h1{color:#0f0;margin-bottom:8px}
+          .card{background:#111;border:1px solid #222;border-radius:12px;padding:16px;margin-bottom:12px}
+          h2{color:#0f0;font-size:1.1em;margin-bottom:10px}
+          input,button{width:100%;padding:10px;margin-bottom:8px;background:#1a1a1a;border:1px solid #333;
+            color:#fff;border-radius:8px;font-size:0.95em}
+          button{background:#0f0;color:#000;font-weight:700;cursor:pointer;border:none}
+          .status{display:inline-block;padding:3px 10px;border-radius:12px;font-size:0.75em;font-weight:700}
+          .ok{background:#0f02;color:#0f0}.bad{background:#f442;color:#f44}
+          pre{background:#0a0a0a;padding:10px;border-radius:8px;font-size:0.75em;max-height:200px;overflow-y:auto;color:#aaa}
+          </style></head><body>
+          <div class="container">
+          <h1>📱 Sideloadly</h1>
+          <p style="color:#888;margin-bottom:16px">Free dev cert · VPN install · No PC</p>
+          
+          <div class="card">
+          <h2>Status</h2>
+          <div id="status">Loading...</div>
+          </div>
+          
+          <div class="card">
+          <h2>Upload IPA</h2>
+          <input type="file" id="ipaFile" accept=".ipa">
+          <button onclick="install()">Sign & Install</button>
+          <div id="result"></div>
+          </div>
+          </div>
+          <script>
+          async function api(e,d={}){
+            const r=await fetch('/api/'+e,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
+            return await r.json()
+          }
+          async function refresh(){
+            const s=await api('status');
+            document.getElementById('status').innerHTML=
+              '<p>VPN: '+(s.iphone_connected?'<span class="status ok">Connected</span> '+s.iphone_ip:'<span class="status bad">Waiting</span>')+'</p>'+
+              '<p>Cert: '+(s.cert_ready?'<span class="status ok">Ready</span>':'<span class="status bad">Generating</span>')+'</p>'+
+              '<p>Team: '+(s.team_id||'...')+'</p>';
+          }
+          async function install(){
+            const f=document.getElementById('ipaFile').files[0];
+            if(!f) return alert('Select IPA');
+            const fd=new FormData();fd.append('ipa',f);
+            const r=await fetch('/api/install',{method:'POST',body:fd});
+            document.getElementById('result').innerHTML='<pre>'+JSON.stringify(await r.json(),null,2)+'</pre>';
+          }
+          setInterval(refresh,5000);refresh()
+          </script></body></html>"""
+          
+          def get_iphone_ip():
+              try:
+                  r = subprocess.run(["sudo","ipsec","status","ikev2-vpn"],capture_output=True,text=True)
+                  for line in r.stdout.split('\n'):
+                      if '10.10.10.' in line and 'ESTABLISHED' in line:
+                          import re
+                          m=re.search(r'10\.10\.10\.\d+',line)
+                          if m: return m.group()
+              except: pass
+              return None
+          
+          @app.route('/')
+          def index(): return render_template_string(HTML)
+          
+          @app.route('/api/status', methods=['POST'])
+          def api_status():
+              return jsonify({
+                  "iphone_connected": get_iphone_ip() is not None,
+                  "iphone_ip": get_iphone_ip() or "N/A",
+                  "cert_ready": os.path.exists("/tmp/dev.p12"),
+                  "team_id": os.environ.get("TEAM_ID","")
+              })
+          
+          @app.route('/api/install', methods=['POST'])
+          def api_install():
+              f = request.files['ipa']
+              ipa_path = UPLOADS / f"{uuid.uuid4()}.ipa"
+              f.save(str(ipa_path))
+              
+              ip = get_iphone_ip()
+              if not ip:
+                  return jsonify({"status":"error","message":"iPhone not connected to VPN"})
+              
+              signed = SIGNED / f"signed_{uuid.uuid4()}.ipa"
+              subprocess.run(["zsign","-k","/tmp/dev.p12","-p","sideloadly",
+                "-m","/tmp/profile.plist","-o",str(signed),str(ipa_path)],check=True)
+              
+              r = subprocess.run(["ideviceinstaller","-n","-d",ip,"install",str(signed)],
+                capture_output=True,text=True)
+              
+              return jsonify({"status":"done","output":r.stdout+r.stderr})
+          
+          app.run(host="0.0.0.0",port=8080)
+          PYEOF
+          
+          nohup python3 /tmp/server.py > /tmp/web.log 2>&1 &
+          sleep 2
+          echo "Web UI on :8080"
+
+      - name: Expose Web UI
+        run: |
+          curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          ./cloudflared tunnel --url http://localhost:8080 > /tmp/tunnel.log 2>&1 &
+          sleep 8
+          TUNNEL=$(grep -o 'https://[a-z0-9.-]*\.trycloudflare\.com' /tmp/tunnel.log | head -1)
+          echo ""
+          echo "=============================================="
+          echo "🌐 Web UI: $TUNNEL"
+          echo "=============================================="
+          echo "📱 VPN Password: $IPHONE_PASS"
+          echo "=============================================="
+
+      - name: Keep alive
+        run: |
+          echo "Server alive. iPhone VPN IP: ${{ env.IPHONE_IP }}"
+          sleep 1800
