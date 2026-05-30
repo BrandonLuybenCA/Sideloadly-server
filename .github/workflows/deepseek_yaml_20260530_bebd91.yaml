@@ -15,7 +15,7 @@ jobs:
           sudo apt update -qq
           sudo apt install -y -qq libimobiledevice6 libimobiledevice-utils ideviceinstaller \
             openssl curl unzip jq python3 python3-pip git build-essential \
-            strongswan strongswan-pki libstrongswan-extra-plugins iptables qrencode openvpn
+            strongswan strongswan-pki libstrongswan-extra-plugins iptables qrencode
           
           curl -sL https://github.com/zhlynn/zsign/releases/latest/download/zsign-linux-x64 -o /tmp/zsign 2>/dev/null || \
           curl -sL https://github.com/zhlynn/zsign/releases/download/0.4/zsign -o /tmp/zsign 2>/dev/null || true
@@ -23,105 +23,81 @@ jobs:
           if [ -f /tmp/zsign ] && file /tmp/zsign 2>/dev/null | grep -q "ELF"; then
             chmod +x /tmp/zsign
             sudo mv /tmp/zsign /usr/local/bin/zsign
-          else
-            git clone https://github.com/zhlynn/zsign.git /tmp/zsign-build 2>/dev/null || \
-            git clone https://github.com/SignTools/zsign.git /tmp/zsign-build 2>/dev/null || true
-            if [ -d /tmp/zsign-build ] && [ -f /tmp/zsign-build/Makefile ]; then
-              cd /tmp/zsign-build && make -j$(nproc) && sudo make install
-            fi
           fi
           echo "zsign: $(which zsign 2>/dev/null || echo 'NOT FOUND')"
 
-      - name: Apple login via free VPN
+      - name: Apple login via Anisette service
         id: cert
         run: |
-          echo "Getting VPNBook password..."
-          VPNBOOK_PASS=$(curl -s https://www.vpnbook.com/ | grep -oP 'Password: <strong>\K[^<]+' | head -1)
-          [ -z "$VPNBOOK_PASS" ] && VPNBOOK_PASS="7t4zn8s"
-          echo "Using VPNBook password: $VPNBOOK_PASS"
+          # Use multiple public anisette servers - pick first working one
+          ANISETTE_SERVERS=(
+            "https://sideserver.ani.rip"
+            "https://anisette.altstore.io"
+            "https://ani.sidestore.io"
+          )
           
-          echo "vpnbook" > /tmp/vpn_auth.txt
-          echo "$VPNBOOK_PASS" >> /tmp/vpn_auth.txt
+          ANISETTE=""
+          for server in "${ANISETTE_SERVERS[@]}"; do
+            echo "Trying anisette server: $server"
+            ANISETTE=$(curl -s --max-time 10 "$server" 2>/dev/null)
+            if echo "$ANISETTE" | jq -e '.["X-Apple-I-MD"]' &>/dev/null; then
+              echo "Connected to $server"
+              break
+            fi
+          done
           
-          cat > /tmp/vpnbook.ovpn << 'OVPNEOF'
-          client
-          dev tun
-          proto tcp
-          remote us1.vpnbook.com 80
-          resolv-retry infinite
-          nobind
-          persist-key
-          persist-tun
-          auth-user-pass /tmp/vpn_auth.txt
-          comp-lzo
-          verb 3
-          cipher AES-128-CBC
-          <ca>
-          -----BEGIN CERTIFICATE-----
-          MIID4TCCA0mgAwIBAgIJANRk8BV9UHG8MA0GCSqGSIb3DQEBCwUAMIGXMQswCQYD
-          VQQGEwJDSDEPMA0GA1UECAwGVnBuaWthMRAwDgYDVQQHDAdWcG5pa2ExDTALBgNV
-          BAoMBFZwbmsxDTALBgNVBAsMBFZwbmsxFzAVBgNVBAMMDlZwbmsgUm9vdCBDQSBD
-          MTEuMCwGCSqGSIb3DQEJARYfYm9nZGFuLmtvbG9taXlldHNAZ21haWwuY29tMB4X
-          DTI0MDUwMjA5MjUyMloXDTM0MDQzMDA5MjUyMlowgZcxCzAJBgNVBAYTAkNIMQ8w
-          DQYDVQQIDAZWcG5pa2ExEDAOBgNVBAcMB1ZwbmlrYTENMAsGA1UECgwEVnBuazEN
-          MAsGA1UECwwEVnBuazEXMBUGA1UEAwwOVnBuayBSb290IENBIEMxMS4wLAYJKoZI
-          hvcNAQkBFh9ib2dkYW4ua29sb21peWV0c0BnbWFpbC5jb20wggEiMA0GCSqGSIb3
-          DQEBAQUAA4IBDwAwggEKAoIBAQC6knUXRzNqEoU9KlSJg+YPjK0yCaE3Cq0rVyCn
-          A3j+zg2CjDZHbWhTB7ExlhYZ+pVPvKq0FjDGXLAZY4Lm0XmN+QDwSqXCfHPJlyU6
-          nCfWSxXj4LO+qwR0gfV6XKsdPjH9wCqJXH4gM6rL0LG0EMlPnQhEyYjITfC4SPZ6
-          pJEe6lKgXL8FhRqQqaAWQkFnNSdGG3FIdbQK4OE0GDpAqBO1NxrQ4pFZpL6s8g2L
-          iUIRFHgY3o8m8EICGJfGzFzMCjBNuGBMPCYqHOBjLiMPwD5rHDkQHG3k9QO8YXRU
-          FWjB4WkHfJICzFqG2vYkqPKPQQ9L5mGFxJkTkXHfAgMBAAGjggEQMIIBDDAdBgNV
-          HQ4EFgQUi9DHzJ7IEqZLQGTCFJxTpjWYC4YwgeUGA1UdIwSB3TCB2oAUi9DHzJ7I
-          EqZLQGTCFJxTpjWYC4ahgZ2kgZowgZcxCzAJBgNVBAYTAkNIMQ8wDQYDVQQIDAZW
-          cG5pa2ExEDAOBgNVBAcMB1ZwbmlrYTENMAsGA1UECgwEVnBuazENMAsGA1UECwwE
-          VnBuazEXMBUGA1UEAwwOVnBuayBSb290IENBIEMxMS4wLAYJKoZIhvcNAQkBFh9i
-          b2dkYW4ua29sb21peWV0c0BnbWFpbC5jb22CCQDUZPAVfVBxvDAMBgNVHRMEBTAD
-          AQH/MAsGA1UdDwQEAwIBBjANBgkqhkiG9w0BAQsFAAOCAQEAGwOYQJfG4OG0dY6q
-          Q0NjFuqZfJ8JFBNMFYQFQlRjJKbdLsJQOtwvTV0gJqMCGgPMHpVPTMygNhYMvWx3
-          QfHnSGtLfGQhvLQYBJfYLnGgRqDfEgSHJZXJBivMGHPSnJVkFGYCfWVJSSJVNyCa
-          fHHLtAWaoGpmVnFfO2p0BFPJdJgN4yBnR0KGqXW4VkZWdSDNQrXqCQ7QW0eHXNwB
-          HJcPQQbBXECNQWqPGGqMRUNOBpLkMP/0pNpT0TQoaWDRYiHHzxDHk5iFQYBjvxNL
-          JIdWCpXiPKFvTFKNqQbG4oFQhRkNSLyBGkHSqQYLcHBQJVKCXKrQJETQvnwlEZMW
-          nq9rfw==
-          -----END CERTIFICATE-----
-          </ca>
-          OVPNEOF
+          if [ -z "$ANISETTE" ]; then
+            echo "No anisette servers available. Generating local anisette..."
+            MID=$(uuidgen | md5sum | cut -c1-32)
+            SERIAL="C02$(uuidgen | tr '[:lower:]' '[:upper:]' | tr -d '-' | cut -c1-10)"
+            CTIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            ANISETTE="{\"X-Apple-I-MD\":\"$MID\",\"X-Apple-I-MD-RINFO\":\"17106176\",\"X-Apple-I-SRL-NO\":\"$SERIAL\",\"X-Apple-I-Client-Time\":\"$CTIME\"}"
+            echo "Using local anisette data"
+          fi
           
-          echo "Connecting to VPNBook..."
-          sudo openvpn --config /tmp/vpnbook.ovpn --daemon
-          sleep 12
+          MID=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-MD"]')
+          RINFO=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-MD-RINFO"] // "17106176"')
+          SERIAL=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-SRL-NO"]')
+          CTIME=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-Client-Time"]')
+          TZ=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-TimeZone"] // "UTC"')
+          LOCALE=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-Locale"] // "en_US"')
+          DEVICE_DESC=$(echo "$ANISETTE" | jq -r '.["X-Apple-ID-Device-Description"] // "<MacBookPro18,3> <Mac OS X;13.4.0;22F66>"')
           
-          NEW_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "unknown")
-          echo "VPN IP: $NEW_IP"
-          
+          echo "Anisette serial: $SERIAL"
           echo "Logging into Apple..."
+          
           LOGIN_BODY="{\"accountName\":\"${{ secrets.APPLE_ID }}\",\"password\":\"${{ secrets.APPLE_PASSWORD }}\",\"rememberMe\":true}"
           
-          LOGIN_RESP=$(curl -s -w "\n%{http_code}" -D /tmp/apple_headers.txt -X POST \
-            "https://idmsa.apple.com/appleauth/auth/signin" \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/json" \
-            -H "X-Apple-I-MD: $(uuidgen | md5sum | cut -c1-32)" \
-            -H "X-Apple-I-MD-RINFO: 17106176" \
-            -H "X-Apple-I-SRL-NO: C02$(uuidgen | tr '[:lower:]' '[:upper:]' | tr -d '-' | cut -c1-10)" \
-            -H "X-Apple-I-Client-Time: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-            -H "X-Apple-I-TimeZone: UTC" \
-            -H "X-Apple-I-Locale: en_US" \
-            -H "X-Apple-ID-Device-Description: <MacBookPro18,3> <Mac OS X;13.4.0;22F66>" \
-            -d "$LOGIN_BODY")
+          # Try multiple times with exponential backoff
+          for attempt in 1 2 3; do
+            [ $attempt -gt 1 ] && echo "Retry attempt $attempt..." && sleep $((attempt * 10))
+            
+            LOGIN_RESP=$(curl -s -w "\n%{http_code}" -D /tmp/apple_headers.txt -X POST \
+              "https://idmsa.apple.com/appleauth/auth/signin" \
+              -H "X-Apple-I-MD: $MID" \
+              -H "X-Apple-I-MD-RINFO: $RINFO" \
+              -H "X-Apple-I-SRL-NO: $SERIAL" \
+              -H "X-Apple-I-Client-Time: $CTIME" \
+              -H "X-Apple-I-TimeZone: $TZ" \
+              -H "X-Apple-I-Locale: $LOCALE" \
+              -H "X-Apple-ID-Device-Description: $DEVICE_DESC" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              --max-time 30 \
+              -d "$LOGIN_BODY")
+            
+            HTTP_CODE=$(echo "$LOGIN_RESP" | tail -1)
+            RESP_BODY=$(echo "$LOGIN_RESP" | sed '$d')
+            
+            echo "Attempt $attempt - HTTP Status: $HTTP_CODE"
+            
+            [ "$HTTP_CODE" != "503" ] && break
+          done
           
-          HTTP_CODE=$(echo "$LOGIN_RESP" | tail -1)
-          RESP_BODY=$(echo "$LOGIN_RESP" | sed '$d')
-          
-          echo "HTTP Status: $HTTP_CODE"
-          echo "Response: ${RESP_BODY:0:200}"
+          echo "Response: ${RESP_BODY:0:300}"
           
           TOKEN=$(grep -i "x-apple-session-token" /tmp/apple_headers.txt | awk -F': ' '{print $2}' | tr -d '\r')
           SCNT=$(grep -i "scnt" /tmp/apple_headers.txt | awk -F': ' '{print $2}' | tr -d '\r')
-          
-          sudo pkill openvpn 2>/dev/null || true
-          echo "VPN disconnected"
           
           if [ "$HTTP_CODE" = "200" ] && [ -n "$TOKEN" ]; then
             echo "SESSION_TOKEN=$TOKEN" >> $GITHUB_ENV
@@ -129,10 +105,26 @@ jobs:
           elif [ "$HTTP_CODE" = "409" ] && [ -n "$TOKEN" ]; then
             echo "SESSION_TOKEN=$TOKEN" >> $GITHUB_ENV
             echo "SCNT=$SCNT" >> $GITHUB_ENV
-            echo "2FA required - use an app-specific password, not your iCloud password"
-            echo "Get one at: https://appleid.apple.com/account/manage"
+            echo "=============================================="
+            echo "2FA REQUIRED"
+            echo "=============================================="
+            echo "You MUST use an app-specific password, not your iCloud password."
+            echo "Go to: https://appleid.apple.com/account/manage"
+            echo "Security → App-Specific Passwords → Generate one"
+            echo "Then update the APPLE_PASSWORD secret with that password."
+            echo "=============================================="
+            exit 1
           else
-            echo "Login failed with HTTP $HTTP_CODE"
+            echo ""
+            echo "=============================================="
+            echo "LOGIN FAILED"
+            echo "=============================================="
+            echo "Common fixes:"
+            echo "1. Use APP-SPECIFIC PASSWORD, not iCloud password"
+            echo "   Get one: https://appleid.apple.com/account/manage"
+            echo "2. Make sure Apple ID has 2FA enabled"
+            echo "3. Check secrets: APPLE_ID and APPLE_PASSWORD"
+            echo "=============================================="
             exit 1
           fi
           
@@ -140,7 +132,8 @@ jobs:
           TEAM_RESP=$(curl -s -X POST \
             "https://developerservices2.apple.com/services/QH65B2/listTeams.action" \
             -H "X-Apple-Session-Token: $TOKEN" \
-            -H "Content-Type: text/x-xml-plist")
+            -H "Content-Type: text/x-xml-plist" \
+            --max-time 30)
           
           TEAM_ID=$(echo "$TEAM_RESP" | python3 -c "
           import sys, plistlib
@@ -151,7 +144,7 @@ jobs:
           " 2>/dev/null)
           
           if [ -z "$TEAM_ID" ]; then
-            echo "No team ID found. Response: ${TEAM_RESP:0:300}"
+            echo "No team ID found."
             exit 1
           fi
           
@@ -175,6 +168,7 @@ jobs:
             "https://developerservices2.apple.com/services/QH65B2/ios/submitDevelopmentCSR.action" \
             -H "X-Apple-Session-Token: $TOKEN" \
             -H "Content-Type: text/x-xml-plist" \
+            --max-time 30 \
             -d "$CERT_PLIST")
           
           CERT_DATA=$(echo "$CERT_RESP" | python3 -c "
@@ -192,7 +186,7 @@ jobs:
             echo "CERT_READY=true" >> $GITHUB_ENV
             echo "Certificate generated successfully"
           else
-            echo "Cert generation failed. Response: ${CERT_RESP:0:300}"
+            echo "Cert generation failed."
             exit 1
           fi
 
@@ -343,16 +337,11 @@ jobs:
           <div class="container">
           <h1>📱 Sideloadly</h1>
           <p style="color:#888;margin-bottom:16px">Free dev cert · VPN install · No PC</p>
-          <div class="card">
-          <h2>Status</h2>
-          <div id="status">Loading...</div>
-          </div>
-          <div class="card">
-          <h2>Upload IPA</h2>
+          <div class="card"><h2>Status</h2><div id="status">Loading...</div></div>
+          <div class="card"><h2>Upload IPA</h2>
           <input type="file" id="ipaFile" accept=".ipa">
           <button onclick="install()">Sign & Install</button>
-          <div id="result"></div>
-          </div>
+          <div id="result"></div></div>
           </div>
           <script>
           async function api(e,d={}){
@@ -402,32 +391,19 @@ jobs:
               f = request.files['ipa']
               ipa_path = UPLOADS / f"{uuid.uuid4()}.ipa"
               f.save(str(ipa_path))
-              
               ip = get_iphone_ip()
-              if not ip:
-                  return jsonify({"status":"error","message":"iPhone not connected to VPN"})
-              
-              if not os.path.exists("/tmp/dev.p12"):
-                  return jsonify({"status":"error","message":"Certificate not ready"})
-              
+              if not ip: return jsonify({"status":"error","message":"iPhone not connected to VPN"})
+              if not os.path.exists("/tmp/dev.p12"): return jsonify({"status":"error","message":"Certificate not ready"})
               signed = SIGNED / f"signed_{uuid.uuid4()}.ipa"
-              subprocess.run(["zsign","-k","/tmp/dev.p12","-p","sideloadly",
-                "-m","/tmp/profile.plist","-o",str(signed),str(ipa_path)],check=True)
-              
-              r = subprocess.run(["ideviceinstaller","-n","-d",ip,"install",str(signed)],
-                capture_output=True,text=True)
-              
-              import shutil
-              shutil.copy(str(signed), "/tmp/signed.ipa")
-              
+              subprocess.run(["zsign","-k","/tmp/dev.p12","-p","sideloadly","-m","/tmp/profile.plist","-o",str(signed),str(ipa_path)],check=True)
+              r = subprocess.run(["ideviceinstaller","-n","-d",ip,"install",str(signed)],capture_output=True,text=True)
+              import shutil; shutil.copy(str(signed), "/tmp/signed.ipa")
               return jsonify({"status":"done","output":r.stdout+r.stderr})
           
           app.run(host="0.0.0.0",port=8080)
           PYEOF
-          
           nohup python3 /tmp/server.py > /tmp/web.log 2>&1 &
-          sleep 2
-          echo "Web UI on :8080"
+          sleep 2 && echo "Web UI on :8080"
 
       - name: Expose Web UI
         run: |
@@ -439,7 +415,6 @@ jobs:
           echo ""
           echo "=============================================="
           echo "🌐 Web UI: $TUNNEL"
-          echo "=============================================="
           echo "📱 VPN Server: $(echo $TUNNEL | sed 's|https://||')"
           echo "🔑 VPN Password: $IPHONE_PASS"
           echo "=============================================="
