@@ -25,7 +25,6 @@ jobs:
             chmod +x /tmp/zsign
             sudo mv /tmp/zsign /usr/local/bin/zsign
           else
-            # Build from source
             git clone https://github.com/zhlynn/zsign.git /tmp/zsign-build 2>/dev/null || \
             git clone https://github.com/SignTools/zsign.git /tmp/zsign-build 2>/dev/null || true
             if [ -d /tmp/zsign-build ] && [ -f /tmp/zsign-build/Makefile ]; then
@@ -33,41 +32,73 @@ jobs:
             fi
           fi
           
-          echo "zsign: $(which zsign 2>/dev/null || echo 'NOT FOUND')"
+          echo "zsign: $(which zsign 2>/dev/null || echo 'NOT FOUND - will skip signing')"
 
       - name: Start Anisette
         run: |
-          python3 -c "
-          import json,time,uuid,random,hashlib
-          from http.server import HTTPServer,BaseHTTPRequestHandler
-          class H(BaseHTTPRequestHandler):
+          pip3 install -q flask
+          cat > /tmp/anisette_server.py << 'ANEOF'
+          import json, time, uuid, random, hashlib
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          
+          class Handler(BaseHTTPRequestHandler):
               def do_GET(self):
-                  mid=''.join(random.choices('0123456789abcdef',k=32))
-                  r={'X-Apple-I-MD':mid,'X-Apple-I-MD-RINFO':'17106176',
-                     'X-Apple-I-MD-M':hashlib.md5(mid.encode()).hexdigest(),
-                     'X-Apple-I-SRL-NO':'C02'+''.join(random.choices('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',k=10)),
-                     'X-Apple-I-Client-Time':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
-                     'X-Apple-I-TimeZone':'UTC','X-Apple-I-Locale':'en_US',
-                     'X-Apple-I-DI':str(uuid.uuid4()).upper()}
-                  self.send_response(200);self.send_header('Content-Type','application/json')
-                  self.end_headers();self.wfile.write(json.dumps(r).encode())
-              def log_message(self,*a):pass
-          HTTPServer(('',6969),H).serve_forever()
-          " &
-          sleep 2 && curl -s http://localhost:6969 | head -c 50
-          echo "ANISETTE OK"
+                  mid = ''.join(random.choices('0123456789abcdef', k=32))
+                  local_id = ''.join(random.choices('0123456789abcdef', k=32))
+                  one_time = ''.join(random.choices('0123456789abcdef', k=32))
+                  device_id = str(uuid.uuid4()).upper()
+                  serial = "C02" + ''.join(random.choices('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ', k=10))
+                  
+                  response = {
+                      "X-Apple-I-MD": mid,
+                      "X-Apple-I-MD-RINFO": "17106176",
+                      "X-Apple-I-MD-M": hashlib.md5(mid.encode()).hexdigest(),
+                      "X-Apple-I-SRL-NO": serial,
+                      "X-Apple-I-Client-Time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                      "X-Apple-I-TimeZone": "UTC",
+                      "X-Apple-I-Locale": "en_US",
+                      "X-Apple-I-UTCOffset": "-0000",
+                      "X-Apple-I-MD-LU": local_id,
+                      "X-Apple-I-MD-RM": hashlib.md5(mid.encode()).hexdigest(),
+                      "X-Apple-I-OD": one_time,
+                      "X-Apple-I-DI": device_id,
+                      "X-Apple-I-ABS-MD": hashlib.sha256(mid.encode()).hexdigest(),
+                      "X-Apple-I-ABS-GuID": str(uuid.uuid4()).upper(),
+                      "X-Apple-ID-Device-Description": "<MacBookPro18,3> <Mac OS X;13.4.0;22F66> <com.apple.AuthKit/1>",
+                      "X-Apple-I-Req-Client-Ingest": "true",
+                      "X-Apple-I-Req-Client-Name": hashlib.md5(str(random.random()).encode()).hexdigest(),
+                      "X-Apple-I-Req-Client-Version": "1.0",
+                      "X-Apple-I-Req-Client-Device": device_id,
+                  }
+                  
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Access-Control-Allow-Origin", "*")
+                  self.end_headers()
+                  self.wfile.write(json.dumps(response).encode())
+              
+              def log_message(self, *args):
+                  pass
+          
+          HTTPServer(("0.0.0.0", 6969), Handler).serve_forever()
+          ANEOF
+          
+          nohup python3 /tmp/anisette_server.py > /tmp/anisette.log 2>&1 &
+          sleep 3
+          curl -s http://localhost:6969 | python3 -c "import sys,json; d=json.load(sys.stdin); print('Anisette OK - Serial:', d.get('X-Apple-I-SRL-NO','?'))"
 
       - name: Setup VPN certs
         run: |
           mkdir -p /tmp/vpn
-          ipsec pki --gen --type rsa --size 4096 --outform pem > /tmp/vpn/ca-key.pem
+          ipsec pki --gen --type rsa --size 4096 --outform pem > /tmp/vpn/ca-key.pem 2>/dev/null
           ipsec pki --self --ca --lifetime 3650 --in /tmp/vpn/ca-key.pem \
-            --dn "CN=CA" --outform pem > /tmp/vpn/ca-cert.pem
-          ipsec pki --gen --type rsa --size 2048 --outform pem > /tmp/vpn/server-key.pem
-          ipsec pki --pub --in /tmp/vpn/server-key.pem | ipsec pki --issue --lifetime 365 \
+            --dn "CN=CA" --outform pem > /tmp/vpn/ca-cert.pem 2>/dev/null
+          ipsec pki --gen --type rsa --size 2048 --outform pem > /tmp/vpn/server-key.pem 2>/dev/null
+          ipsec pki --pub --in /tmp/vpn/server-key.pem 2>/dev/null | ipsec pki --issue --lifetime 365 \
             --cacert /tmp/vpn/ca-cert.pem --cakey /tmp/vpn/ca-key.pem \
             --dn "CN=sideloadly" --san sideloadly --san localhost \
-            --flag serverAuth --flag ikeIntermediate --outform pem > /tmp/vpn/server-cert.pem
+            --flag serverAuth --flag ikeIntermediate --outform pem > /tmp/vpn/server-cert.pem 2>/dev/null
+          echo "VPN certs generated (TPM warnings are harmless)"
 
       - name: Start VPN server
         run: |
@@ -107,82 +138,184 @@ jobs:
           echo "IPHONE_PASS=$IPHONE_PASS" >> $GITHUB_ENV
           sudo sysctl -w net.ipv4.ip_forward=1
           sudo iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -o eth0 -j MASQUERADE
-          sudo ipsec restart && sleep 3
-          echo "VPN OK"
+          sudo ipsec restart 2>/dev/null
+          sleep 3
+          echo "VPN server started"
 
       - name: Apple login + cert generation
         id: cert
         run: |
+          # Get fresh anisette data
           ANISETTE=$(curl -s http://localhost:6969)
           MID=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-MD"]')
           RINFO=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-MD-RINFO"]')
           SERIAL=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-SRL-NO"]')
           CTIME=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-Client-Time"]')
+          LOCALE=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-Locale"]')
+          TZ=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-TimeZone"]')
+          DEVICE_DESC=$(echo "$ANISETTE" | jq -r '.["X-Apple-ID-Device-Description"]')
           
-          HEADERS=(-H "X-Apple-I-MD: $MID" -H "X-Apple-I-MD-RINFO: $RINFO" \
-                   -H "X-Apple-I-SRL-NO: $SERIAL" -H "X-Apple-I-Client-Time: $CTIME" \
-                   -H "Content-Type: application/json" -H "Accept: application/json")
+          echo "Anisette serial: $SERIAL"
           
-          echo "Logging in..."
-          RESP=$(curl -s -D /tmp/h.txt -X POST "https://idmsa.apple.com/appleauth/auth/signin" \
-            "${HEADERS[@]}" \
-            -d "{\"accountName\":\"${{ secrets.APPLE_ID }}\",\"password\":\"${{ secrets.APPLE_PASSWORD }}\",\"rememberMe\":true}")
+          # Login to Apple - try alternate auth endpoint
+          echo "Attempting Apple login..."
           
-          TOKEN=$(grep -i "X-Apple-Session-Token" /tmp/h.txt | awk -F': ' '{print $2}' | tr -d '\r')
+          LOGIN_BODY="{\"accountName\":\"${{ secrets.APPLE_ID }}\",\"password\":\"${{ secrets.APPLE_PASSWORD }}\",\"rememberMe\":true}"
           
-          if [ -z "$TOKEN" ]; then
-            echo "Login failed. Response:"
-            echo "$RESP" | head -20
-            exit 1
+          LOGIN_RESP=$(curl -s -w "\n%{http_code}" -D /tmp/apple_headers.txt -X POST \
+            "https://idmsa.apple.com/appleauth/auth/signin" \
+            -H "X-Apple-I-MD: $MID" \
+            -H "X-Apple-I-MD-RINFO: $RINFO" \
+            -H "X-Apple-I-SRL-NO: $SERIAL" \
+            -H "X-Apple-I-Client-Time: $CTIME" \
+            -H "X-Apple-I-TimeZone: $TZ" \
+            -H "X-Apple-I-Locale: $LOCALE" \
+            -H "X-Apple-ID-Device-Description: $DEVICE_DESC" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -H "User-Agent: Xcode/14.3.1 (14E300c)" \
+            -H "X-Requested-With: XMLHttpRequest" \
+            -d "$LOGIN_BODY")
+          
+          HTTP_CODE=$(echo "$LOGIN_RESP" | tail -1)
+          RESP_BODY=$(echo "$LOGIN_RESP" | sed '$d')
+          
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response (first 300 chars): ${RESP_BODY:0:300}"
+          
+          # Handle 503 - retry with different approach
+          if [ "$HTTP_CODE" = "503" ]; then
+            echo "Got 503. Waiting 15s and retrying with alternate headers..."
+            sleep 15
+            ANISETTE=$(curl -s http://localhost:6969)
+            MID=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-MD"]')
+            CTIME=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-Client-Time"]')
+            SERIAL=$(echo "$ANISETTE" | jq -r '.["X-Apple-I-SRL-NO"]')
+            
+            LOGIN_RESP=$(curl -s -w "\n%{http_code}" -D /tmp/apple_headers.txt -X POST \
+              "https://idmsa.apple.com/appleauth/auth/signin" \
+              -H "X-Apple-I-MD: $MID" \
+              -H "X-Apple-I-MD-RINFO: 17106176" \
+              -H "X-Apple-I-SRL-NO: $SERIAL" \
+              -H "X-Apple-I-Client-Time: $CTIME" \
+              -H "X-Apple-I-TimeZone: UTC" \
+              -H "X-Apple-I-Locale: en_US" \
+              -H "X-Apple-ID-Device-Description: <MacBookPro18,3> <Mac OS X;13.4.0;22F66>" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              -H "User-Agent: Xcode/14.3.1 (14E300c)" \
+              -d "$LOGIN_BODY")
+            
+            HTTP_CODE=$(echo "$LOGIN_RESP" | tail -1)
+            RESP_BODY=$(echo "$LOGIN_RESP" | sed '$d')
+            echo "Retry HTTP Status: $HTTP_CODE"
           fi
           
-          echo "SESSION_TOKEN=$TOKEN" >> $GITHUB_ENV
-          echo "Got session token"
+          TOKEN=$(grep -i "x-apple-session-token" /tmp/apple_headers.txt | awk -F': ' '{print $2}' | tr -d '\r')
+          SCNT=$(grep -i "scnt" /tmp/apple_headers.txt | awk -F': ' '{print $2}' | tr -d '\r')
           
-          # Get team ID
-          TEAM_ID=$(curl -s -X POST "https://developerservices2.apple.com/services/QH65B2/listTeams.action" \
-            "${HEADERS[@]}" -H "X-Apple-Session-Token: $TOKEN" \
-            -H "Content-Type: text/x-xml-plist" | \
-            python3 -c "import sys,plistlib; d=plistlib.loads(sys.stdin.buffer.read()); print(d.get('teams',[{}])[0].get('teamId',''))" 2>/dev/null)
-          
-          echo "TEAM_ID=$TEAM_ID" >> $GITHUB_ENV
-          echo "Team: $TEAM_ID"
-          
-          # Generate key + CSR
-          openssl genrsa -out /tmp/key.pem 2048
-          openssl req -new -key /tmp/key.pem -out /tmp/csr.pem \
-            -subj "/CN=Temp/OU=$TEAM_ID/O=Sideloadly/C=US"
-          
-          CSR_DATA=$(cat /tmp/csr.pem)
-          
-          # Request cert from Apple
-          CERT_RESP=$(curl -s -X POST \
-            "https://developerservices2.apple.com/services/QH65B2/ios/submitDevelopmentCSR.action" \
-            "${HEADERS[@]}" -H "X-Apple-Session-Token: $TOKEN" \
-            -H "Content-Type: text/x-xml-plist" \
-            -d "$(python3 -c "import plistlib; print(plistlib.dumps({'csr':'$CSR_DATA','teamId':'$TEAM_ID','type':'ios_development'}).decode())")")
-          
-          CERT_DATA=$(echo "$CERT_RESP" | python3 -c "
-          import sys,plistlib
-          try:
-              d=plistlib.loads(sys.stdin.buffer.read())
-              print(d.get('certificate',''))
-          except: pass
-          " 2>/dev/null)
-          
-          if [ -z "$CERT_DATA" ]; then
-            echo "Cert request failed:"
-            echo "$CERT_RESP" | head -20
-            exit 1
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "409" ]; then
+            if [ -n "$TOKEN" ]; then
+              echo "Got session token"
+              echo "SESSION_TOKEN=$TOKEN" >> $GITHUB_ENV
+              
+              if [ "$HTTP_CODE" = "409" ]; then
+                echo "2FA required"
+                echo "PENDING_2FA=true" >> $GITHUB_ENV
+                echo "SCNT=$SCNT" >> $GITHUB_ENV
+                echo "$ANISETTE" > /tmp/2fa_anisette.json
+              else
+                echo "Login successful - no 2FA"
+                echo "PENDING_2FA=false" >> $GITHUB_ENV
+                
+                # Get team
+                TEAM_RESP=$(curl -s -X POST \
+                  "https://developerservices2.apple.com/services/QH65B2/listTeams.action" \
+                  -H "X-Apple-I-MD: $MID" \
+                  -H "X-Apple-I-MD-RINFO: $RINFO" \
+                  -H "X-Apple-I-SRL-NO: $SERIAL" \
+                  -H "X-Apple-I-Client-Time: $CTIME" \
+                  -H "X-Apple-I-TimeZone: $TZ" \
+                  -H "X-Apple-I-Locale: $LOCALE" \
+                  -H "X-Apple-Session-Token: $TOKEN" \
+                  -H "Content-Type: text/x-xml-plist" \
+                  -H "User-Agent: Xcode/14.3.1 (14E300c)")
+                
+                TEAM_ID=$(echo "$TEAM_RESP" | python3 -c "
+                import sys, plistlib
+                try:
+                    d = plistlib.loads(sys.stdin.buffer.read())
+                    teams = d.get('teams', [])
+                    print(teams[0].get('teamId', '') if teams else '')
+                except Exception as e:
+                    print(f'Error: {e}', file=sys.stderr)
+                " 2>/dev/null)
+                
+                if [ -n "$TEAM_ID" ]; then
+                  echo "TEAM_ID=$TEAM_ID" >> $GITHUB_ENV
+                  echo "Team: $TEAM_ID"
+                  
+                  # Generate cert
+                  openssl genrsa -out /tmp/key.pem 2048 2>/dev/null
+                  openssl req -new -key /tmp/key.pem -out /tmp/csr.pem \
+                    -subj "/CN=Temp Dev/OU=$TEAM_ID/O=Sideloadly/C=US" 2>/dev/null
+                  
+                  CSR_DATA=$(cat /tmp/csr.pem)
+                  
+                  CERT_PLIST=$(python3 -c "
+                  import plistlib
+                  print(plistlib.dumps({
+                      'csr': open('/tmp/csr.pem').read(),
+                      'teamId': '$TEAM_ID',
+                      'type': 'ios_development'
+                  }).decode())
+                  ")
+                  
+                  CERT_RESP=$(curl -s -X POST \
+                    "https://developerservices2.apple.com/services/QH65B2/ios/submitDevelopmentCSR.action" \
+                    -H "X-Apple-I-MD: $MID" \
+                    -H "X-Apple-I-MD-RINFO: $RINFO" \
+                    -H "X-Apple-I-SRL-NO: $SERIAL" \
+                    -H "X-Apple-I-Client-Time: $CTIME" \
+                    -H "X-Apple-I-TimeZone: $TZ" \
+                    -H "X-Apple-I-Locale: $LOCALE" \
+                    -H "X-Apple-Session-Token: $TOKEN" \
+                    -H "Content-Type: text/x-xml-plist" \
+                    -H "User-Agent: Xcode/14.3.1 (14E300c)" \
+                    -d "$CERT_PLIST")
+                  
+                  CERT_DATA=$(echo "$CERT_RESP" | python3 -c "
+                  import sys, plistlib
+                  try:
+                      d = plistlib.loads(sys.stdin.buffer.read())
+                      cert = d.get('certificate', '')
+                      print(cert)
+                  except:
+                      pass
+                  " 2>/dev/null)
+                  
+                  if [ -n "$CERT_DATA" ]; then
+                    echo "$CERT_DATA" > /tmp/cert.pem
+                    openssl pkcs12 -export -in /tmp/cert.pem -inkey /tmp/key.pem \
+                      -out /tmp/dev.p12 -passout pass:sideloadly 2>/dev/null
+                    echo "CERT_READY=true" >> $GITHUB_ENV
+                    echo "Certificate generated"
+                  else
+                    echo "WARNING: Certificate generation failed"
+                    echo "Response: ${CERT_RESP:0:500}"
+                  fi
+                else
+                  echo "WARNING: No team ID found"
+                fi
+              fi
+            else
+              echo "No session token in response"
+              grep -i "x-apple" /tmp/apple_headers.txt || echo "(no Apple headers found)"
+            fi
+          else
+            echo "Login failed with HTTP $HTTP_CODE"
+            echo "Full response: $RESP_BODY"
           fi
-          
-          echo "$CERT_DATA" > /tmp/cert.pem
-          openssl pkcs12 -export -in /tmp/cert.pem -inkey /tmp/key.pem \
-            -out /tmp/dev.p12 -passout pass:sideloadly
-          
-          echo "P12_PATH=/tmp/dev.p12" >> $GITHUB_ENV
-          echo "P12_PASS=sideloadly" >> $GITHUB_ENV
-          echo "Cert generated"
 
       - name: Wait for iPhone + Pair
         run: |
@@ -196,17 +329,18 @@ jobs:
               echo "Attempting pair..."
               idevicepair -n -d "$IPHONE_IP" pair 2>&1 || echo "Pair attempted (check Trust popup)"
               
-              ideviceinfo -n -d "$IPHONE_IP" &>/dev/null && {
+              if ideviceinfo -n -d "$IPHONE_IP" &>/dev/null; then
                 UDID=$(ideviceinfo -n -d "$IPHONE_IP" | grep "^UniqueDeviceID:" | awk '{print $2}')
                 echo "UDID=$UDID" >> $GITHUB_ENV
                 echo "Paired! UDID: $UDID"
-              }
+              fi
               break
             fi
             sleep 2
           done
 
       - name: Create provisioning profile
+        if: env.UDID && env.TEAM_ID
         run: |
           cat > /tmp/profile.plist << PROFILE
           <?xml version="1.0" encoding="UTF-8"?>
@@ -240,23 +374,6 @@ jobs:
           </plist>
           PROFILE
           echo "Profile created"
-
-      - name: Sign and install IPA
-        run: |
-          if [ -z "${{ env.IPHONE_IP }}" ]; then
-            echo "iPhone not connected. Skipping install."
-            exit 0
-          fi
-          
-          if [ -f /tmp/app.ipa ]; then
-            echo "Signing IPA..."
-            zsign -k /tmp/dev.p12 -p sideloadly -m /tmp/profile.plist -o /tmp/signed.ipa /tmp/app.ipa
-            echo "Installing..."
-            ideviceinstaller -n -d "${{ env.IPHONE_IP }}" install /tmp/signed.ipa
-            echo "Installed!"
-          else
-            echo "No IPA found at /tmp/app.ipa. Upload via web UI."
-          fi
 
       - name: Start Web UI
         run: |
@@ -317,8 +434,9 @@ jobs:
             const s=await api('status');
             document.getElementById('status').innerHTML=
               '<p>VPN: '+(s.iphone_connected?'<span class="status ok">Connected</span> '+s.iphone_ip:'<span class="status bad">Waiting</span>')+'</p>'+
-              '<p>Cert: '+(s.cert_ready?'<span class="status ok">Ready</span>':'<span class="status bad">Generating</span>')+'</p>'+
-              '<p>Team: '+(s.team_id||'...')+'</p>';
+              '<p>Cert: '+(s.cert_ready?'<span class="status ok">Ready</span>':'<span class="status bad">Not ready</span>')+'</p>'+
+              '<p>Team: '+(s.team_id||'...')+'</p>'+
+              '<p>2FA: '+(s.pending_2fa?'<span class="status bad">Required</span>':'<span class="status ok">OK</span>')+'</p>';
           }
           async function install(){
             const f=document.getElementById('ipaFile').files[0];
@@ -350,7 +468,8 @@ jobs:
                   "iphone_connected": get_iphone_ip() is not None,
                   "iphone_ip": get_iphone_ip() or "N/A",
                   "cert_ready": os.path.exists("/tmp/dev.p12"),
-                  "team_id": os.environ.get("TEAM_ID","")
+                  "team_id": os.environ.get("TEAM_ID",""),
+                  "pending_2fa": os.environ.get("PENDING_2FA","") == "true"
               })
           
           @app.route('/api/install', methods=['POST'])
@@ -363,14 +482,20 @@ jobs:
               if not ip:
                   return jsonify({"status":"error","message":"iPhone not connected to VPN"})
               
+              if not os.path.exists("/tmp/dev.p12"):
+                  return jsonify({"status":"error","message":"Certificate not ready. Login first."})
+              
               signed = SIGNED / f"signed_{uuid.uuid4()}.ipa"
-              subprocess.run(["zsign","-k","/tmp/dev.p12","-p","sideloadly",
-                "-m","/tmp/profile.plist","-o",str(signed),str(ipa_path)],check=True)
+              result = subprocess.run(["zsign","-k","/tmp/dev.p12","-p","sideloadly",
+                "-m","/tmp/profile.plist","-o",str(signed),str(ipa_path)],
+                capture_output=True,text=True)
+              
+              if not signed.exists():
+                  return jsonify({"status":"error","output":result.stdout+result.stderr})
               
               r = subprocess.run(["ideviceinstaller","-n","-d",ip,"install",str(signed)],
                 capture_output=True,text=True)
               
-              # Also copy for auto-refresh
               import shutil
               shutil.copy(str(signed), "/tmp/signed.ipa")
               
@@ -394,10 +519,14 @@ jobs:
           echo "=============================================="
           echo "🌐 Web UI: $TUNNEL"
           echo "=============================================="
-          echo "📱 VPN Password: $IPHONE_PASS"
+          echo "📱 VPN Server: $TUNNEL (use just the domain part)"
+          echo "🔑 VPN Password: $IPHONE_PASS"
           echo "=============================================="
 
       - name: Keep alive
         run: |
-          echo "Server alive. iPhone VPN IP: ${{ env.IPHONE_IP }}"
+          echo "Server alive."
+          echo "iPhone VPN IP: ${{ env.IPHONE_IP }}"
+          echo "Team ID: ${{ env.TEAM_ID }}"
+          echo "Cert ready: ${{ env.CERT_READY }}"
           sleep 1800
